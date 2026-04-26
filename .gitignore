@@ -1,0 +1,17 @@
+# Environment / secrets
+.env
+
+# Bot auto-generated files
+log_channels.json
+server_audit.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# macOS
+.DS_Store
