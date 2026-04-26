@@ -107,23 +107,23 @@ async def on_ready():
 @bot.command(name="setlog")
 @commands.has_permissions(manage_guild=True)
 async def setlog(ctx: commands.Context, channel: discord.TextChannel | None = None):
-    """Set the channel where audit logs should be posted. Defaults to the current channel."""
+    """監査ログを投稿するチャンネルを設定します。省略した場合は現在のチャンネルになります。"""
     channel = channel or ctx.channel
     log_channels[str(ctx.guild.id)] = channel.id
     save_config(log_channels)
-    await ctx.reply(f"✅ Audit logs will now be posted in {channel.mention}.")
+    await ctx.reply(f"✅ 監査ログは {channel.mention} に投稿されます。")
 
 
 @bot.command(name="unsetlog")
 @commands.has_permissions(manage_guild=True)
 async def unsetlog(ctx: commands.Context):
-    """Stop logging to a channel for this server."""
+    """このサーバーのログ投稿を停止します。"""
     if str(ctx.guild.id) in log_channels:
         del log_channels[str(ctx.guild.id)]
         save_config(log_channels)
-        await ctx.reply("🛑 Audit logging disabled for this server.")
+        await ctx.reply("🛑 このサーバーの監査ログを無効にしました。")
     else:
-        await ctx.reply("No log channel was set.")
+        await ctx.reply("ログチャンネルが設定されていません。")
 
 
 # ---------------------------------------------------------------------------
@@ -134,16 +134,16 @@ async def on_message_delete(message: discord.Message):
     if message.author.bot:
         return
     embed = make_embed(
-        "🗑️ Message Deleted",
+        "🗑️ メッセージ削除",
         color=discord.Color.red(),
     )
-    embed.add_field(name="Author", value=f"{message.author.mention} (`{message.author}`)", inline=True)
-    embed.add_field(name="Channel", value=message.channel.mention, inline=True)
+    embed.add_field(name="送信者", value=f"{message.author.mention} (`{message.author}`)", inline=True)
+    embed.add_field(name="チャンネル", value=message.channel.mention, inline=True)
     if message.content:
-        embed.add_field(name="Content", value=message.content[:1024], inline=False)
+        embed.add_field(name="内容", value=message.content[:1024], inline=False)
     if message.attachments:
         embed.add_field(
-            name="Attachments",
+            name="添付ファイル",
             value="\n".join(a.filename for a in message.attachments),
             inline=False,
         )
@@ -155,8 +155,8 @@ async def on_bulk_message_delete(messages: list[discord.Message]):
     if not messages:
         return
     embed = make_embed(
-        "🗑️ Bulk Message Delete",
-        f"{len(messages)} messages were deleted in {messages[0].channel.mention}",
+        "🗑️ 一括メッセージ削除",
+        f"{messages[0].channel.mention} で {len(messages)} 件のメッセージが削除されました",
         color=discord.Color.red(),
     )
     await send_log(messages[0].guild, embed)
@@ -167,14 +167,14 @@ async def on_message_edit(before: discord.Message, after: discord.Message):
     if before.author.bot or before.content == after.content:
         return
     embed = make_embed(
-        "✏️ Message Edited",
+        "✏️ メッセージ編集",
         color=discord.Color.orange(),
     )
-    embed.add_field(name="Author", value=f"{before.author.mention} (`{before.author}`)", inline=True)
-    embed.add_field(name="Channel", value=before.channel.mention, inline=True)
-    embed.add_field(name="Before", value=(before.content or "*empty*")[:1024], inline=False)
-    embed.add_field(name="After", value=(after.content or "*empty*")[:1024], inline=False)
-    embed.add_field(name="Jump", value=f"[Go to message]({after.jump_url})", inline=False)
+    embed.add_field(name="送信者", value=f"{before.author.mention} (`{before.author}`)", inline=True)
+    embed.add_field(name="チャンネル", value=before.channel.mention, inline=True)
+    embed.add_field(name="変更前", value=(before.content or "*空*")[:1024], inline=False)
+    embed.add_field(name="変更後", value=(after.content or "*空*")[:1024], inline=False)
+    embed.add_field(name="ジャンプ", value=f"[メッセージへジャンプ]({after.jump_url})", inline=False)
     await send_log(before.guild, embed)
 
 
@@ -184,26 +184,26 @@ async def on_message_edit(before: discord.Message, after: discord.Message):
 @bot.event
 async def on_member_join(member: discord.Member):
     embed = make_embed(
-        "📥 Member Joined",
+        "📥 メンバー参加",
         f"{member.mention} (`{member}`)",
         color=discord.Color.green(),
     )
-    embed.add_field(name="Account Created", value=discord.utils.format_dt(member.created_at, "R"))
-    embed.add_field(name="Member Count", value=str(member.guild.member_count))
+    embed.add_field(name="アカウント作成日", value=discord.utils.format_dt(member.created_at, "R"))
+    embed.add_field(name="メンバー数", value=str(member.guild.member_count))
     await send_log(member.guild, embed)
 
 
 @bot.event
 async def on_member_remove(member: discord.Member):
     embed = make_embed(
-        "📤 Member Left",
+        "📤 メンバー退出",
         f"{member.mention} (`{member}`)",
         color=discord.Color.dark_gray(),
     )
-    embed.add_field(name="Joined", value=discord.utils.format_dt(member.joined_at, "R") if member.joined_at else "Unknown")
+    embed.add_field(name="参加日", value=discord.utils.format_dt(member.joined_at, "R") if member.joined_at else "不明")
     roles = [r.mention for r in member.roles if r.name != "@everyone"]
     if roles:
-        embed.add_field(name="Roles", value=" ".join(roles)[:1024], inline=False)
+        embed.add_field(name="ロール", value=" ".join(roles)[:1024], inline=False)
     await send_log(member.guild, embed)
 
 
@@ -211,22 +211,22 @@ async def on_member_remove(member: discord.Member):
 async def on_member_update(before: discord.Member, after: discord.Member):
     changes = []
     if before.nick != after.nick:
-        changes.append(f"**Nickname:** `{before.nick}` → `{after.nick}`")
+        changes.append(f"**ニックネーム:** `{before.nick}` → `{after.nick}`")
     if before.roles != after.roles:
         added = [r.mention for r in after.roles if r not in before.roles]
         removed = [r.mention for r in before.roles if r not in after.roles]
         if added:
-            changes.append(f"**Roles added:** {' '.join(added)}")
+            changes.append(f"**追加されたロール:** {' '.join(added)}")
         if removed:
-            changes.append(f"**Roles removed:** {' '.join(removed)}")
+            changes.append(f"**削除されたロール:** {' '.join(removed)}")
     if before.timed_out_until != after.timed_out_until and after.timed_out_until:
-        changes.append(f"**Timed out until:** {discord.utils.format_dt(after.timed_out_until)}")
+        changes.append(f"**タイムアウト期限:** {discord.utils.format_dt(after.timed_out_until)}")
 
     if not changes:
         return
 
     embed = make_embed(
-        "👤 Member Updated",
+        "👤 メンバー更新",
         f"{after.mention} (`{after}`)\n" + "\n".join(changes),
         color=discord.Color.blue(),
     )
@@ -235,21 +235,21 @@ async def on_member_update(before: discord.Member, after: discord.Member):
 
 @bot.event
 async def on_user_update(before: discord.User, after: discord.User):
-    """Username / global avatar / display name changes."""
+    """ユーザー名・グローバルアバター・表示名の変更を記録します。"""
     changes = []
     if before.name != after.name:
-        changes.append(f"**Username:** `{before.name}` → `{after.name}`")
+        changes.append(f"**ユーザー名:** `{before.name}` → `{after.name}`")
     if before.global_name != after.global_name:
-        changes.append(f"**Display name:** `{before.global_name}` → `{after.global_name}`")
+        changes.append(f"**表示名:** `{before.global_name}` → `{after.global_name}`")
     if before.avatar != after.avatar:
-        changes.append("**Avatar changed.**")
+        changes.append("**アバターが変更されました。**")
     if not changes:
         return
     # Push to every guild the user shares with the bot
     for guild in bot.guilds:
         if guild.get_member(after.id):
             embed = make_embed(
-                "🪪 User Profile Updated",
+                "🪪 ユーザープロフィール更新",
                 f"{after.mention}\n" + "\n".join(changes),
                 color=discord.Color.blue(),
             )
@@ -259,7 +259,7 @@ async def on_user_update(before: discord.User, after: discord.User):
 @bot.event
 async def on_member_ban(guild: discord.Guild, user: discord.User):
     embed = make_embed(
-        "🔨 Member Banned",
+        "🔨 メンバーBAN",
         f"{user.mention} (`{user}`)",
         color=discord.Color.dark_red(),
     )
@@ -267,9 +267,9 @@ async def on_member_ban(guild: discord.Guild, user: discord.User):
     try:
         async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.ban):
             if entry.target.id == user.id:
-                embed.add_field(name="Moderator", value=entry.user.mention)
+                embed.add_field(name="モデレーター", value=entry.user.mention)
                 if entry.reason:
-                    embed.add_field(name="Reason", value=entry.reason, inline=False)
+                    embed.add_field(name="理由", value=entry.reason, inline=False)
                 break
     except discord.Forbidden:
         pass
@@ -279,7 +279,7 @@ async def on_member_ban(guild: discord.Guild, user: discord.User):
 @bot.event
 async def on_member_unban(guild: discord.Guild, user: discord.User):
     embed = make_embed(
-        "♻️ Member Unbanned",
+        "♻️ メンバーBAN解除",
         f"`{user}` (`{user.id}`)",
         color=discord.Color.green(),
     )
@@ -292,8 +292,8 @@ async def on_member_unban(guild: discord.Guild, user: discord.User):
 @bot.event
 async def on_guild_channel_create(channel: discord.abc.GuildChannel):
     embed = make_embed(
-        "📁 Channel Created",
-        f"{channel.mention} (`{channel.name}`)\nType: {channel.type}",
+        "📁 チャンネル作成",
+        f"{channel.mention} (`{channel.name}`)\nタイプ: {channel.type}",
         color=discord.Color.green(),
     )
     await send_log(channel.guild, embed)
@@ -302,8 +302,8 @@ async def on_guild_channel_create(channel: discord.abc.GuildChannel):
 @bot.event
 async def on_guild_channel_delete(channel: discord.abc.GuildChannel):
     embed = make_embed(
-        "🗑️ Channel Deleted",
-        f"`#{channel.name}` (Type: {channel.type})",
+        "🗑️ チャンネル削除",
+        f"`#{channel.name}` (タイプ: {channel.type})",
         color=discord.Color.red(),
     )
     await send_log(channel.guild, embed)
@@ -313,17 +313,17 @@ async def on_guild_channel_delete(channel: discord.abc.GuildChannel):
 async def on_guild_channel_update(before: discord.abc.GuildChannel, after: discord.abc.GuildChannel):
     changes = []
     if before.name != after.name:
-        changes.append(f"**Name:** `{before.name}` → `{after.name}`")
+        changes.append(f"**名前:** `{before.name}` → `{after.name}`")
     if hasattr(before, "topic") and before.topic != after.topic:
-        changes.append(f"**Topic:** `{before.topic}` → `{after.topic}`")
+        changes.append(f"**トピック:** `{before.topic}` → `{after.topic}`")
     if before.position != after.position:
-        changes.append(f"**Position:** {before.position} → {after.position}")
+        changes.append(f"**位置:** {before.position} → {after.position}")
     if hasattr(before, "nsfw") and before.nsfw != after.nsfw:
         changes.append(f"**NSFW:** {before.nsfw} → {after.nsfw}")
     if not changes:
         return
     embed = make_embed(
-        "🔧 Channel Updated",
+        "🔧 チャンネル更新",
         f"{after.mention}\n" + "\n".join(changes),
         color=discord.Color.orange(),
     )
@@ -336,7 +336,7 @@ async def on_guild_channel_update(before: discord.abc.GuildChannel, after: disco
 @bot.event
 async def on_guild_role_create(role: discord.Role):
     embed = make_embed(
-        "✨ Role Created",
+        "✨ ロール作成",
         f"{role.mention} (`{role.name}`)",
         color=discord.Color.green(),
     )
@@ -346,7 +346,7 @@ async def on_guild_role_create(role: discord.Role):
 @bot.event
 async def on_guild_role_delete(role: discord.Role):
     embed = make_embed(
-        "🗑️ Role Deleted",
+        "🗑️ ロール削除",
         f"`{role.name}`",
         color=discord.Color.red(),
     )
@@ -357,19 +357,19 @@ async def on_guild_role_delete(role: discord.Role):
 async def on_guild_role_update(before: discord.Role, after: discord.Role):
     changes = []
     if before.name != after.name:
-        changes.append(f"**Name:** `{before.name}` → `{after.name}`")
+        changes.append(f"**名前:** `{before.name}` → `{after.name}`")
     if before.color != after.color:
-        changes.append(f"**Color:** {before.color} → {after.color}")
+        changes.append(f"**カラー:** {before.color} → {after.color}")
     if before.permissions != after.permissions:
-        changes.append("**Permissions changed.**")
+        changes.append("**権限が変更されました。**")
     if before.hoist != after.hoist:
-        changes.append(f"**Hoist:** {before.hoist} → {after.hoist}")
+        changes.append(f"**ホイスト:** {before.hoist} → {after.hoist}")
     if before.mentionable != after.mentionable:
-        changes.append(f"**Mentionable:** {before.mentionable} → {after.mentionable}")
+        changes.append(f"**メンション可能:** {before.mentionable} → {after.mentionable}")
     if not changes:
         return
     embed = make_embed(
-        "🔧 Role Updated",
+        "🔧 ロール更新",
         f"{after.mention}\n" + "\n".join(changes),
         color=discord.Color.orange(),
     )
@@ -385,35 +385,35 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
         # Mute/deafen/stream changes
         changes = []
         if before.self_mute != after.self_mute:
-            changes.append(f"Self mute: {before.self_mute} → {after.self_mute}")
+            changes.append(f"自己ミュート: {before.self_mute} → {after.self_mute}")
         if before.self_deaf != after.self_deaf:
-            changes.append(f"Self deafen: {before.self_deaf} → {after.self_deaf}")
+            changes.append(f"自己スピーカーミュート: {before.self_deaf} → {after.self_deaf}")
         if before.self_stream != after.self_stream:
-            changes.append(f"Streaming: {before.self_stream} → {after.self_stream}")
+            changes.append(f"配信: {before.self_stream} → {after.self_stream}")
         if before.self_video != after.self_video:
-            changes.append(f"Camera: {before.self_video} → {after.self_video}")
+            changes.append(f"カメラ: {before.self_video} → {after.self_video}")
         if not changes:
             return
         embed = make_embed(
-            "🎙️ Voice State Changed",
-            f"{member.mention} in {after.channel.mention}\n" + "\n".join(changes),
+            "🎙️ ボイス状態変更",
+            f"{member.mention} ({after.channel.mention} 内)\n" + "\n".join(changes),
             color=discord.Color.blue(),
         )
     elif before.channel is None:
         embed = make_embed(
-            "🔊 Joined Voice",
-            f"{member.mention} joined {after.channel.mention}",
+            "🔊 ボイス参加",
+            f"{member.mention} が {after.channel.mention} に参加しました",
             color=discord.Color.green(),
         )
     elif after.channel is None:
         embed = make_embed(
-            "🔇 Left Voice",
-            f"{member.mention} left {before.channel.mention}",
+            "🔇 ボイス退出",
+            f"{member.mention} が {before.channel.mention} を退出しました",
             color=discord.Color.dark_gray(),
         )
     else:
         embed = make_embed(
-            "🔁 Switched Voice Channels",
+            "🔁 ボイスチャンネル移動",
             f"{member.mention}: {before.channel.mention} → {after.channel.mention}",
             color=discord.Color.blue(),
         )
@@ -428,8 +428,8 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.User):
     if user.bot:
         return
     embed = make_embed(
-        "➕ Reaction Added",
-        f"{user.mention} added {reaction.emoji} to a message in {reaction.message.channel.mention}\n[Jump]({reaction.message.jump_url})",
+        "➕ リアクション追加",
+        f"{user.mention} が {reaction.message.channel.mention} のメッセージに {reaction.emoji} を追加しました\n[ジャンプ]({reaction.message.jump_url})",
         color=discord.Color.gold(),
     )
     await send_log(reaction.message.guild, embed)
@@ -440,8 +440,8 @@ async def on_reaction_remove(reaction: discord.Reaction, user: discord.User):
     if user.bot:
         return
     embed = make_embed(
-        "➖ Reaction Removed",
-        f"{user.mention} removed {reaction.emoji} from a message in {reaction.message.channel.mention}\n[Jump]({reaction.message.jump_url})",
+        "➖ リアクション削除",
+        f"{user.mention} が {reaction.message.channel.mention} のメッセージから {reaction.emoji} を削除しました\n[ジャンプ]({reaction.message.jump_url})",
         color=discord.Color.dark_gold(),
     )
     await send_log(reaction.message.guild, embed)
@@ -453,20 +453,20 @@ async def on_reaction_remove(reaction: discord.Reaction, user: discord.User):
 @bot.event
 async def on_thread_create(thread: discord.Thread):
     embed = make_embed(
-        "🧵 Thread Created",
-        f"{thread.mention} in {thread.parent.mention if thread.parent else 'unknown'}",
+        "🧵 スレッド作成",
+        f"{thread.mention}（{thread.parent.mention if thread.parent else '不明'} 内）",
         color=discord.Color.green(),
     )
     if thread.owner:
-        embed.add_field(name="Created by", value=thread.owner.mention)
+        embed.add_field(name="作成者", value=thread.owner.mention)
     await send_log(thread.guild, embed)
 
 
 @bot.event
 async def on_thread_delete(thread: discord.Thread):
     embed = make_embed(
-        "🗑️ Thread Deleted",
-        f"`{thread.name}` from {thread.parent.mention if thread.parent else 'unknown'}",
+        "🗑️ スレッド削除",
+        f"`{thread.name}`（{thread.parent.mention if thread.parent else '不明'} 内）",
         color=discord.Color.red(),
     )
     await send_log(thread.guild, embed)
@@ -476,15 +476,15 @@ async def on_thread_delete(thread: discord.Thread):
 async def on_thread_update(before: discord.Thread, after: discord.Thread):
     changes = []
     if before.name != after.name:
-        changes.append(f"**Name:** `{before.name}` → `{after.name}`")
+        changes.append(f"**名前:** `{before.name}` → `{after.name}`")
     if before.archived != after.archived:
-        changes.append(f"**Archived:** {before.archived} → {after.archived}")
+        changes.append(f"**アーカイブ:** {before.archived} → {after.archived}")
     if before.locked != after.locked:
-        changes.append(f"**Locked:** {before.locked} → {after.locked}")
+        changes.append(f"**ロック:** {before.locked} → {after.locked}")
     if not changes:
         return
     embed = make_embed(
-        "🔧 Thread Updated",
+        "🔧 スレッド更新",
         f"{after.mention}\n" + "\n".join(changes),
         color=discord.Color.orange(),
     )
@@ -498,17 +498,17 @@ async def on_thread_update(before: discord.Thread, after: discord.Thread):
 async def on_guild_update(before: discord.Guild, after: discord.Guild):
     changes = []
     if before.name != after.name:
-        changes.append(f"**Name:** `{before.name}` → `{after.name}`")
+        changes.append(f"**名前:** `{before.name}` → `{after.name}`")
     if before.icon != after.icon:
-        changes.append("**Server icon changed.**")
+        changes.append("**サーバーアイコンが変更されました。**")
     if before.owner_id != after.owner_id:
-        changes.append(f"**Owner:** <@{before.owner_id}> → <@{after.owner_id}>")
+        changes.append(f"**オーナー:** <@{before.owner_id}> → <@{after.owner_id}>")
     if before.verification_level != after.verification_level:
-        changes.append(f"**Verification:** {before.verification_level} → {after.verification_level}")
+        changes.append(f"**認証レベル:** {before.verification_level} → {after.verification_level}")
     if not changes:
         return
     embed = make_embed(
-        "🏛️ Server Updated",
+        "🏛️ サーバー更新",
         "\n".join(changes),
         color=discord.Color.purple(),
     )
@@ -521,32 +521,32 @@ async def on_guild_emojis_update(guild: discord.Guild, before: tuple, after: tup
     removed = set(before) - set(after)
     desc = []
     if added:
-        desc.append("**Added:** " + " ".join(str(e) for e in added))
+        desc.append("**追加:** " + " ".join(str(e) for e in added))
     if removed:
-        desc.append("**Removed:** " + " ".join(f"`:{e.name}:`" for e in removed))
-    embed = make_embed("😀 Emojis Updated", "\n".join(desc), color=discord.Color.gold())
+        desc.append("**削除:** " + " ".join(f"`:{e.name}:`" for e in removed))
+    embed = make_embed("😀 絵文字更新", "\n".join(desc), color=discord.Color.gold())
     await send_log(guild, embed)
 
 
 @bot.event
 async def on_invite_create(invite: discord.Invite):
     embed = make_embed(
-        "🔗 Invite Created",
-        f"`{invite.code}` for {invite.channel.mention}",
+        "🔗 招待作成",
+        f"`{invite.code}`（{invite.channel.mention} 向け）",
         color=discord.Color.green(),
     )
     if invite.inviter:
-        embed.add_field(name="By", value=invite.inviter.mention)
-    embed.add_field(name="Max Uses", value=str(invite.max_uses or "∞"))
-    embed.add_field(name="Expires", value=discord.utils.format_dt(invite.expires_at) if invite.expires_at else "Never")
+        embed.add_field(name="作成者", value=invite.inviter.mention)
+    embed.add_field(name="最大使用回数", value=str(invite.max_uses or "∞"))
+    embed.add_field(name="有効期限", value=discord.utils.format_dt(invite.expires_at) if invite.expires_at else "なし")
     await send_log(invite.guild, embed)
 
 
 @bot.event
 async def on_invite_delete(invite: discord.Invite):
     embed = make_embed(
-        "🔗 Invite Deleted",
-        f"`{invite.code}` for {invite.channel.mention if invite.channel else 'unknown'}",
+        "🔗 招待削除",
+        f"`{invite.code}`（{invite.channel.mention if invite.channel else '不明'} 向け）",
         color=discord.Color.red(),
     )
     await send_log(invite.guild, embed)
@@ -558,12 +558,12 @@ async def on_invite_delete(invite: discord.Invite):
 @bot.event
 async def on_command_error(ctx: commands.Context, error: commands.CommandError):
     if isinstance(error, commands.MissingPermissions):
-        await ctx.reply("❌ You don't have permission to do that.")
+        await ctx.reply("❌ その操作を行う権限がありません。")
     elif isinstance(error, commands.CommandNotFound):
         return
     else:
         log.error(f"Command error: {error}")
-        await ctx.reply(f"⚠️ Error: {error}")
+        await ctx.reply(f"⚠️ エラー: {error}")
 
 
 # ---------------------------------------------------------------------------
