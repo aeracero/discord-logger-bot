@@ -7,11 +7,12 @@ log channel (and to a local file as a backup).
 Setup:
   1. Create an application + bot at https://discord.com/developers/applications
   2. Enable ALL Privileged Gateway Intents (Presence, Server Members, Message Content)
-  3. Invite the bot to your server with the "Administrator" permission (or at minimum:
-     View Audit Log, View Channels, Read Message History, Send Messages, Embed Links)
+  3. Invite the bot to your server with the "Administrator" permission
   4. Put your token in a .env file (see .env.example)
   5. In your server, run:  !setlog #your-log-channel
   6. Enable alt detection with:  !altdetection on
+  7. Manage NG words with:  /ngword add | remove | list | clear
+  8. View/change bot settings: /settings show | mute_duration | alt_similarity | alt_max_age
 """
 
 import os
@@ -22,6 +23,7 @@ import datetime
 from pathlib import Path
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
@@ -29,18 +31,23 @@ from dotenv import load_dotenv
 # Configuration
 # ---------------------------------------------------------------------------
 load_dotenv()
-TOKEN = os.getenv("DISCORD_TOKEN")
+TOKEN          = os.getenv("DISCORD_TOKEN")
 COMMAND_PREFIX = os.getenv("COMMAND_PREFIX", "!")
-CONFIG_PATH = Path("log_channels.json")
-LOG_FILE_PATH = Path("server_audit.log")
-BANNED_USERS_PATH = Path("banned_users.json")
-ALT_CONFIG_PATH = Path("alt_detection.json")
+CONFIG_PATH          = Path("log_channels.json")
+LOG_FILE_PATH        = Path("server_audit.log")
+BANNED_USERS_PATH    = Path("banned_users.json")
+ALT_CONFIG_PATH      = Path("alt_detection.json")
+NG_WORDS_PATH        = Path("ng_words.json")
+GUILD_SETTINGS_PATH  = Path("guild_settings.json")
 
-# Alt detection settings
-ALT_USERNAME_SIMILARITY = 0.75   # 75% username similarity triggers a flag
-ALT_MAX_ACCOUNT_AGE_DAYS = 30    # Accounts newer than this are considered suspicious
+# Default values (used when no per-guild setting is saved)
+DEFAULT_MUTE_DURATION_MINUTES  = 10    # How long an auto-mute lasts
+DEFAULT_ALT_SIMILARITY         = 0.75  # 75 % username similarity triggers alt flag
+DEFAULT_ALT_MAX_AGE_DAYS       = 30    # Accounts newer than this are suspicious
 
-# File logger (backup of everything that gets posted to Discord)
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -62,9 +69,13 @@ def load_json(path: Path) -> dict:
 def save_json(path: Path, data: dict) -> None:
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
-log_channels: dict   = load_json(CONFIG_PATH)        # {guild_id: channel_id}
-banned_users: dict   = load_json(BANNED_USERS_PATH)  # {guild_id: [{user_id, username, banned_at, created_at}]}
-alt_config: dict     = load_json(ALT_CONFIG_PATH)    # {guild_id: {"enabled": bool}}
+log_channels:   dict = load_json(CONFIG_PATH)
+banned_users:   dict = load_json(BANNED_USERS_PATH)
+alt_config:     dict = load_json(ALT_CONFIG_PATH)
+ng_words:       dict = load_json(NG_WORDS_PATH)
+guild_settings: dict = load_json(GUILD_SETTINGS_PATH)
+# ng_words structure:     {guild_id: [{"word": str, "action": "mute"|"ban", "added_by": int}]}
+# guild_settings structure: {guild_id: {"mute_duration": int, "alt_similarity": float, "alt_max_age": int}}
 
 # ---------------------------------------------------------------------------
 # Bot setup
@@ -73,8 +84,10 @@ intents = discord.Intents.all()
 bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents)
 
 
+# ---------------------------------------------------------------------------
+# Utility functions
+# ---------------------------------------------------------------------------
 async def send_log(guild: discord.Guild | None, embed: discord.Embed) -> None:
-    """Send an embed to the configured log channel for this guild + write to file."""
     if guild is None:
         return
     log.info(f"[{guild.name}] {embed.title} :: {embed.description or ''}")
@@ -104,23 +117,60 @@ def make_embed(title: str, description: str = "", color: discord.Color = discord
 
 
 def username_similarity(a: str, b: str) -> float:
-    """Return a 0-1 similarity score between two usernames (case-insensitive)."""
     return difflib.SequenceMatcher(None, a.lower(), b.lower()).ratio()
 
 
+def get_setting(guild_id: str, key: str):
+    """Return a per-guild setting, falling back to the global default."""
+    defaults = {
+        "mute_duration":  DEFAULT_MUTE_DURATION_MINUTES,
+        "alt_similarity": DEFAULT_ALT_SIMILARITY,
+        "alt_max_age":    DEFAULT_ALT_MAX_AGE_DAYS,
+    }
+    return guild_settings.get(guild_id, {}).get(key, defaults[key])
+
+
+def set_setting(guild_id: str, key: str, value) -> None:
+    guild_settings.setdefault(guild_id, {})[key] = value
+    save_json(GUILD_SETTINGS_PATH, guild_settings)
+
+
 # ---------------------------------------------------------------------------
-# Commands
+# Startup
 # ---------------------------------------------------------------------------
 @bot.event
 async def on_ready():
     log.info(f"Logged in as {bot.user} (id={bot.user.id})")
     log.info(f"Watching {len(bot.guilds)} guild(s)")
+    try:
+        synced = await bot.tree.sync()
+        log.info(f"Synced {len(synced)} slash command(s)")
+    except Exception as e:
+        log.error(f"Failed to sync slash commands: {e}")
+
+
+# ===========================================================================
+# PREFIX COMMANDS
+# ===========================================================================
+
+@bot.command(name="sync")
+@commands.has_permissions(manage_guild=True)
+async def sync_commands(ctx: commands.Context):
+    """Instantly syncs slash commands to this server."""
+    await ctx.reply("⏳ スラッシュコマンドを同期中...")
+    try:
+        bot.tree.copy_global_to(guild=ctx.guild)
+        synced = await bot.tree.sync(guild=ctx.guild)
+        await ctx.reply(f"✅ {len(synced)} 個のスラッシュコマンドをこのサーバーに同期しました。")
+        log.info(f"Synced {len(synced)} command(s) to guild {ctx.guild.name}")
+    except Exception as e:
+        await ctx.reply(f"⚠️ 同期に失敗しました: {e}")
+        log.error(f"Failed to sync to guild: {e}")
 
 
 @bot.command(name="setlog")
 @commands.has_permissions(manage_guild=True)
 async def setlog(ctx: commands.Context, channel: discord.TextChannel | None = None):
-    """監査ログを投稿するチャンネルを設定します。"""
     channel = channel or ctx.channel
     log_channels[str(ctx.guild.id)] = channel.id
     save_json(CONFIG_PATH, log_channels)
@@ -130,7 +180,6 @@ async def setlog(ctx: commands.Context, channel: discord.TextChannel | None = No
 @bot.command(name="unsetlog")
 @commands.has_permissions(manage_guild=True)
 async def unsetlog(ctx: commands.Context):
-    """このサーバーのログ投稿を停止します。"""
     if str(ctx.guild.id) in log_channels:
         del log_channels[str(ctx.guild.id)]
         save_json(CONFIG_PATH, log_channels)
@@ -142,17 +191,19 @@ async def unsetlog(ctx: commands.Context):
 @bot.command(name="altdetection")
 @commands.has_permissions(manage_guild=True)
 async def altdetection(ctx: commands.Context, setting: str = ""):
-    """Altアカウント自動検出のON/OFFを切り替えます。使い方: !altdetection on/off"""
     guild_id = str(ctx.guild.id)
     s = setting.lower()
     if s in ("on", "オン", "有効", "enable"):
         alt_config.setdefault(guild_id, {})["enabled"] = True
         save_json(ALT_CONFIG_PATH, alt_config)
+        alt_sim = get_setting(guild_id, "alt_similarity")
+        alt_age = get_setting(guild_id, "alt_max_age")
         await ctx.reply(
-            "✅ Altアカウント自動検出を **有効** にしました。\n"
-            f"・ユーザー名の類似度が **{ALT_USERNAME_SIMILARITY:.0%}** 以上\n"
-            f"・アカウント作成日が **{ALT_MAX_ACCOUNT_AGE_DAYS}日以内**\n"
-            "の条件でBANされたユーザーのAltと判定します。"
+            f"✅ Altアカウント自動検出を **有効** にしました。\n"
+            f"・ユーザー名の類似度が **{alt_sim:.0%}** 以上\n"
+            f"・アカウント作成日が **{alt_age}日以内**\n"
+            "の条件でBANされたユーザーのAltと判定します。\n"
+            "設定変更は `/settings alt_similarity` と `/settings alt_max_age` で行えます。"
         )
     elif s in ("off", "オフ", "無効", "disable"):
         alt_config.setdefault(guild_id, {})["enabled"] = False
@@ -163,40 +214,297 @@ async def altdetection(ctx: commands.Context, setting: str = ""):
         status = "有効 ✅" if enabled else "無効 🛑"
         await ctx.reply(
             f"現在の状態: **{status}**\n"
-            f"切り替えるには `{COMMAND_PREFIX}altdetection on` または `{COMMAND_PREFIX}altdetection off` を使用してください。"
+            f"`{COMMAND_PREFIX}altdetection on/off` で切り替えてください。"
         )
 
 
-# ---------------------------------------------------------------------------
-# Alt detection helper — called from on_member_join
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# SLASH COMMANDS — NG Word Management
+# ===========================================================================
+
+ng_group = app_commands.Group(
+    name="ngword",
+    description="NGワードの管理",
+    default_permissions=discord.Permissions(manage_guild=True),
+)
+
+
+@ng_group.command(name="add", description="NGワードを追加します")
+@app_commands.describe(
+    word="追加するNGワード",
+    action="検出時のアクション",
+)
+@app_commands.choices(action=[
+    app_commands.Choice(name="🔇 ミュート（/settings mute_duration で変更可）", value="mute"),
+    app_commands.Choice(name="🔨 BAN", value="ban"),
+])
+async def ngword_add(interaction: discord.Interaction, word: str, action: app_commands.Choice[str]):
+    guild_id = str(interaction.guild_id)
+    ng_words.setdefault(guild_id, [])
+    word_lower = word.lower().strip()
+    if not word_lower:
+        await interaction.response.send_message("⚠️ 有効なワードを入力してください。", ephemeral=True)
+        return
+    for entry in ng_words[guild_id]:
+        if entry["word"] == word_lower:
+            await interaction.response.send_message(
+                f"⚠️ `{word}` はすでにNGワードリストに登録されています。", ephemeral=True
+            )
+            return
+    ng_words[guild_id].append({
+        "word": word_lower,
+        "action": action.value,
+        "added_by": interaction.user.id,
+    })
+    save_json(NG_WORDS_PATH, ng_words)
+    mute_dur = get_setting(str(interaction.guild_id), "mute_duration")
+    action_label = f"ミュート（{mute_dur}分）" if action.value == "mute" else "BAN"
+    await interaction.response.send_message(
+        f"✅ NGワード `{word_lower}` を追加しました。\nアクション: **{action_label}**",
+        ephemeral=True,
+    )
+    log.info(f"[{interaction.guild.name}] NGワード追加: '{word_lower}' → {action.value} by {interaction.user}")
+
+
+@ng_group.command(name="remove", description="NGワードを削除します")
+@app_commands.describe(word="削除するNGワード")
+async def ngword_remove(interaction: discord.Interaction, word: str):
+    guild_id = str(interaction.guild_id)
+    word_lower = word.lower().strip()
+    original = ng_words.get(guild_id, [])
+    updated = [e for e in original if e["word"] != word_lower]
+    if len(updated) == len(original):
+        await interaction.response.send_message(
+            f"⚠️ `{word}` はNGワードリストに見つかりません。", ephemeral=True
+        )
+        return
+    ng_words[guild_id] = updated
+    save_json(NG_WORDS_PATH, ng_words)
+    await interaction.response.send_message(
+        f"🗑️ NGワード `{word_lower}` を削除しました。", ephemeral=True
+    )
+
+
+@ng_group.command(name="list", description="NGワードの一覧を表示します")
+async def ngword_list(interaction: discord.Interaction):
+    guild_id = str(interaction.guild_id)
+    entries = ng_words.get(guild_id, [])
+    if not entries:
+        await interaction.response.send_message(
+            "NGワードが設定されていません。`/ngword add` で追加してください。", ephemeral=True
+        )
+        return
+    mute_dur = get_setting(guild_id, "mute_duration")
+    lines = []
+    for e in entries:
+        action_label = f"🔇 ミュート（{mute_dur}分）" if e["action"] == "mute" else "🔨 BAN"
+        lines.append(f"`{e['word']}` → {action_label}")
+    embed = discord.Embed(
+        title="📋 NGワード一覧",
+        description="\n".join(lines),
+        color=discord.Color.blurple(),
+        timestamp=datetime.datetime.now(datetime.timezone.utc),
+    )
+    embed.set_footer(text=f"{len(entries)} 件登録済み")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@ng_group.command(name="clear", description="このサーバーのNGワードをすべて削除します")
+async def ngword_clear(interaction: discord.Interaction):
+    guild_id = str(interaction.guild_id)
+    count = len(ng_words.get(guild_id, []))
+    ng_words[guild_id] = []
+    save_json(NG_WORDS_PATH, ng_words)
+    await interaction.response.send_message(
+        f"🗑️ {count} 件のNGワードをすべて削除しました。", ephemeral=True
+    )
+
+
+bot.tree.add_command(ng_group)
+
+
+# ===========================================================================
+# SLASH COMMANDS — Bot Settings
+# ===========================================================================
+
+settings_group = app_commands.Group(
+    name="settings",
+    description="Botの各種設定を変更します",
+    default_permissions=discord.Permissions(manage_guild=True),
+)
+
+
+@settings_group.command(name="show", description="現在の設定を表示します")
+async def settings_show(interaction: discord.Interaction):
+    guild_id = str(interaction.guild_id)
+    mute_dur  = get_setting(guild_id, "mute_duration")
+    alt_sim   = get_setting(guild_id, "alt_similarity")
+    alt_age   = get_setting(guild_id, "alt_max_age")
+    embed = discord.Embed(
+        title="⚙️ 現在の設定",
+        color=discord.Color.blurple(),
+        timestamp=datetime.datetime.now(datetime.timezone.utc),
+    )
+    embed.add_field(name="🔇 ミュート時間",               value=f"{mute_dur} 分",  inline=True)
+    embed.add_field(name="🤖 Alt検出・ユーザー名類似度",   value=f"{alt_sim:.0%}", inline=True)
+    embed.add_field(name="🤖 Alt検出・最大アカウント日数", value=f"{alt_age} 日",  inline=True)
+    embed.set_footer(text="変更は /settings mute_duration / alt_similarity / alt_max_age で行えます")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@settings_group.command(name="mute_duration", description="NGワード検出時の自動ミュート時間を設定します")
+@app_commands.describe(minutes="ミュート時間（分）。1〜1440 の範囲で指定してください。")
+async def settings_mute(interaction: discord.Interaction, minutes: int):
+    if not 1 <= minutes <= 1440:
+        await interaction.response.send_message(
+            "⚠️ 1〜1440 分の範囲で指定してください。", ephemeral=True
+        )
+        return
+    guild_id = str(interaction.guild_id)
+    set_setting(guild_id, "mute_duration", minutes)
+    await interaction.response.send_message(
+        f"✅ ミュート時間を **{minutes} 分** に設定しました。", ephemeral=True
+    )
+    log.info(f"[{interaction.guild.name}] ミュート時間を {minutes} 分に変更 by {interaction.user}")
+
+
+@settings_group.command(name="alt_similarity", description="Altアカウント検出のユーザー名類似度のしきい値を設定します")
+@app_commands.describe(percent="類似度（%）。例: 75 = 75%。50〜100 の範囲で指定してください。")
+async def settings_alt_sim(interaction: discord.Interaction, percent: int):
+    if not 50 <= percent <= 100:
+        await interaction.response.send_message(
+            "⚠️ 50〜100 の範囲で指定してください。", ephemeral=True
+        )
+        return
+    guild_id = str(interaction.guild_id)
+    set_setting(guild_id, "alt_similarity", percent / 100)
+    await interaction.response.send_message(
+        f"✅ Alt検出・ユーザー名類似度のしきい値を **{percent}%** に設定しました。", ephemeral=True
+    )
+    log.info(f"[{interaction.guild.name}] Alt類似度しきい値を {percent}% に変更 by {interaction.user}")
+
+
+@settings_group.command(name="alt_max_age", description="Alt検出で『新規アカウント』とみなすアカウント作成日数を設定します")
+@app_commands.describe(days="アカウント作成からの日数。1〜365 の範囲で指定してください。")
+async def settings_alt_age(interaction: discord.Interaction, days: int):
+    if not 1 <= days <= 365:
+        await interaction.response.send_message(
+            "⚠️ 1〜365 日の範囲で指定してください。", ephemeral=True
+        )
+        return
+    guild_id = str(interaction.guild_id)
+    set_setting(guild_id, "alt_max_age", days)
+    await interaction.response.send_message(
+        f"✅ Alt検出・最大アカウント日数を **{days} 日** に設定しました。", ephemeral=True
+    )
+    log.info(f"[{interaction.guild.name}] Alt最大アカウント日数を {days} 日に変更 by {interaction.user}")
+
+
+bot.tree.add_command(settings_group)
+
+
+# ===========================================================================
+# NG WORD DETECTION — on_message
+# ===========================================================================
+
+@bot.event
+async def on_message(message: discord.Message):
+    # Always process prefix commands first
+    await bot.process_commands(message)
+
+    if message.author.bot or not message.guild:
+        return
+
+    # Skip members with manage_guild (mods/admins)
+    if isinstance(message.author, discord.Member) and message.author.guild_permissions.manage_guild:
+        return
+
+    guild_id = str(message.guild.id)
+    entries = ng_words.get(guild_id, [])
+    if not entries:
+        return
+
+    content_lower = message.content.lower()
+    for entry in entries:
+        if entry["word"] in content_lower:
+            word     = entry["word"]
+            action   = entry["action"]
+            author   = message.author
+            mute_dur = get_setting(guild_id, "mute_duration")
+
+            # Delete the offending message
+            try:
+                await message.delete()
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+
+            if action == "mute":
+                until = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=mute_dur)
+                try:
+                    await author.timeout(until, reason=f"NGワード検出: {word}")
+                except (discord.Forbidden, discord.HTTPException) as e:
+                    log.warning(f"Cannot mute {author} for NG word: {e}")
+
+                embed = make_embed(
+                    "🔇 NGワード検出 — 自動ミュート",
+                    f"{author.mention} (`{author}`) をミュートしました。",
+                    color=discord.Color.orange(),
+                )
+                embed.add_field(name="検出ワード", value=f"||`{word}`||", inline=True)
+                embed.add_field(name="チャンネル", value=message.channel.mention, inline=True)
+                embed.add_field(name="ミュート期間", value=f"{mute_dur}分", inline=True)
+                embed.add_field(name="メッセージ内容", value=f"||{message.content[:500]}||", inline=False)
+
+            else:  # ban
+                try:
+                    await message.guild.ban(author, reason=f"NGワード検出: {word}")
+                except (discord.Forbidden, discord.HTTPException) as e:
+                    log.warning(f"Cannot ban {author} for NG word: {e}")
+
+                embed = make_embed(
+                    "🔨 NGワード検出 — 自動BAN",
+                    f"{author.mention} (`{author}`) をBANしました。",
+                    color=discord.Color.dark_red(),
+                )
+                embed.add_field(name="検出ワード", value=f"||`{word}`||", inline=True)
+                embed.add_field(name="チャンネル", value=message.channel.mention, inline=True)
+                embed.add_field(name="メッセージ内容", value=f"||{message.content[:500]}||", inline=False)
+
+            await send_log(message.guild, embed)
+            log.info(f"[{message.guild.name}] NGワード '{word}' 検出 → {action} : {author}")
+            break  # Only apply one action even if multiple NG words match
+
+
+# ===========================================================================
+# ALT DETECTION
+# ===========================================================================
+
 async def check_for_alt(member: discord.Member) -> None:
     guild_id = str(member.guild.id)
     if not alt_config.get(guild_id, {}).get("enabled", False):
         return
-
     banned_list = banned_users.get(guild_id, [])
     now = datetime.datetime.now(datetime.timezone.utc)
     account_age_days = (now - member.created_at).days
 
+    alt_sim = get_setting(guild_id, "alt_similarity")
+    alt_max_age = get_setting(guild_id, "alt_max_age")
+
     for entry in banned_list:
-        # Skip if it's somehow the same user ID
         if entry["user_id"] == member.id:
             continue
-
         similarity = username_similarity(member.name, entry["username"])
         banned_at = datetime.datetime.fromisoformat(entry["banned_at"])
         created_after_ban = member.created_at.replace(tzinfo=datetime.timezone.utc) > banned_at
-
         is_alt = False
         reason_parts = []
 
-        if similarity >= ALT_USERNAME_SIMILARITY:
+        if similarity >= alt_sim:
             reason_parts.append(f"ユーザー名がBANユーザー `{entry['username']}` に類似 (類似度: {similarity:.0%})")
             if created_after_ban:
                 reason_parts.append("BAN後にアカウントを作成")
                 is_alt = True
-            elif account_age_days <= ALT_MAX_ACCOUNT_AGE_DAYS:
+            elif account_age_days <= alt_max_age:
                 reason_parts.append(f"アカウント作成日が {account_age_days} 日前（新規）")
                 is_alt = True
 
@@ -213,17 +521,17 @@ async def check_for_alt(member: discord.Member) -> None:
                 embed.add_field(name="アカウント作成日", value=discord.utils.format_dt(member.created_at, "R"), inline=True)
                 embed.add_field(name="元のBANユーザー", value=f"`{entry['username']}` (ID: {entry['user_id']})", inline=True)
                 await send_log(member.guild, embed)
-                log.info(f"Auto-banned alt account {member} in {member.guild.name}: {reason_str}")
-            except discord.Forbidden:
-                log.warning(f"Cannot auto-ban suspected alt {member} in {member.guild.name} — missing permissions")
-            except discord.HTTPException as e:
-                log.error(f"Failed to auto-ban alt {member}: {e}")
-            break  # Only ban once even if multiple banned users match
+            except (discord.Forbidden, discord.HTTPException) as e:
+                log.warning(f"Cannot auto-ban suspected alt {member}: {e}")
+            break
 
 
-# ---------------------------------------------------------------------------
-# MESSAGE EVENTS
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# AUDIT LOG EVENTS
+# ===========================================================================
+
+# ── Messages ────────────────────────────────────────────────────────────────
+
 @bot.event
 async def on_message_delete(message: discord.Message):
     if message.author.bot:
@@ -263,30 +571,20 @@ async def on_message_edit(before: discord.Message, after: discord.Message):
     await send_log(before.guild, embed)
 
 
-# ---------------------------------------------------------------------------
-# MEMBER EVENTS
-# ---------------------------------------------------------------------------
+# ── Members ─────────────────────────────────────────────────────────────────
+
 @bot.event
 async def on_member_join(member: discord.Member):
-    embed = make_embed(
-        "📥 メンバー参加",
-        f"{member.mention} (`{member}`)",
-        color=discord.Color.green(),
-    )
+    embed = make_embed("📥 メンバー参加", f"{member.mention} (`{member}`)", color=discord.Color.green())
     embed.add_field(name="アカウント作成日", value=discord.utils.format_dt(member.created_at, "R"))
     embed.add_field(name="メンバー数", value=str(member.guild.member_count))
     await send_log(member.guild, embed)
-    # Run alt detection after logging the join
     await check_for_alt(member)
 
 
 @bot.event
 async def on_member_remove(member: discord.Member):
-    embed = make_embed(
-        "📤 メンバー退出",
-        f"{member.mention} (`{member}`)",
-        color=discord.Color.dark_gray(),
-    )
+    embed = make_embed("📤 メンバー退出", f"{member.mention} (`{member}`)", color=discord.Color.dark_gray())
     embed.add_field(name="参加日", value=discord.utils.format_dt(member.joined_at, "R") if member.joined_at else "不明")
     roles = [r.mention for r in member.roles if r.name != "@everyone"]
     if roles:
@@ -300,21 +598,15 @@ async def on_member_update(before: discord.Member, after: discord.Member):
     if before.nick != after.nick:
         changes.append(f"**ニックネーム:** `{before.nick}` → `{after.nick}`")
     if before.roles != after.roles:
-        added = [r.mention for r in after.roles if r not in before.roles]
+        added   = [r.mention for r in after.roles  if r not in before.roles]
         removed = [r.mention for r in before.roles if r not in after.roles]
-        if added:
-            changes.append(f"**追加されたロール:** {' '.join(added)}")
-        if removed:
-            changes.append(f"**削除されたロール:** {' '.join(removed)}")
+        if added:   changes.append(f"**追加されたロール:** {' '.join(added)}")
+        if removed: changes.append(f"**削除されたロール:** {' '.join(removed)}")
     if before.timed_out_until != after.timed_out_until and after.timed_out_until:
         changes.append(f"**タイムアウト期限:** {discord.utils.format_dt(after.timed_out_until)}")
     if not changes:
         return
-    embed = make_embed(
-        "👤 メンバー更新",
-        f"{after.mention} (`{after}`)\n" + "\n".join(changes),
-        color=discord.Color.blue(),
-    )
+    embed = make_embed("👤 メンバー更新", f"{after.mention} (`{after}`)\n" + "\n".join(changes), color=discord.Color.blue())
     await send_log(after.guild, embed)
 
 
@@ -331,20 +623,14 @@ async def on_user_update(before: discord.User, after: discord.User):
         return
     for guild in bot.guilds:
         if guild.get_member(after.id):
-            embed = make_embed(
-                "🪪 ユーザープロフィール更新",
-                f"{after.mention}\n" + "\n".join(changes),
-                color=discord.Color.blue(),
-            )
+            embed = make_embed("🪪 ユーザープロフィール更新", f"{after.mention}\n" + "\n".join(changes), color=discord.Color.blue())
             await send_log(guild, embed)
 
 
 @bot.event
 async def on_member_ban(guild: discord.Guild, user: discord.User):
-    # Store banned user info for alt detection
     guild_id = str(guild.id)
     banned_users.setdefault(guild_id, [])
-    # Avoid duplicates
     if not any(e["user_id"] == user.id for e in banned_users[guild_id]):
         banned_users[guild_id].append({
             "user_id": user.id,
@@ -353,12 +639,7 @@ async def on_member_ban(guild: discord.Guild, user: discord.User):
             "account_created_at": user.created_at.isoformat(),
         })
         save_json(BANNED_USERS_PATH, banned_users)
-
-    embed = make_embed(
-        "🔨 メンバーBAN",
-        f"{user.mention} (`{user}`)",
-        color=discord.Color.dark_red(),
-    )
+    embed = make_embed("🔨 メンバーBAN", f"{user.mention} (`{user}`)", color=discord.Color.dark_red())
     try:
         async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.ban):
             if entry.target.id == user.id:
@@ -373,40 +654,25 @@ async def on_member_ban(guild: discord.Guild, user: discord.User):
 
 @bot.event
 async def on_member_unban(guild: discord.Guild, user: discord.User):
-    # Remove from banned list so they're no longer flagged for alt detection
     guild_id = str(guild.id)
     if guild_id in banned_users:
         banned_users[guild_id] = [e for e in banned_users[guild_id] if e["user_id"] != user.id]
         save_json(BANNED_USERS_PATH, banned_users)
-
-    embed = make_embed(
-        "♻️ メンバーBAN解除",
-        f"`{user}` (`{user.id}`)",
-        color=discord.Color.green(),
-    )
+    embed = make_embed("♻️ メンバーBAN解除", f"`{user}` (`{user.id}`)", color=discord.Color.green())
     await send_log(guild, embed)
 
 
-# ---------------------------------------------------------------------------
-# CHANNEL EVENTS
-# ---------------------------------------------------------------------------
+# ── Channels ─────────────────────────────────────────────────────────────────
+
 @bot.event
 async def on_guild_channel_create(channel: discord.abc.GuildChannel):
-    embed = make_embed(
-        "📁 チャンネル作成",
-        f"{channel.mention} (`{channel.name}`)\nタイプ: {channel.type}",
-        color=discord.Color.green(),
-    )
+    embed = make_embed("📁 チャンネル作成", f"{channel.mention} (`{channel.name}`)\nタイプ: {channel.type}", color=discord.Color.green())
     await send_log(channel.guild, embed)
 
 
 @bot.event
 async def on_guild_channel_delete(channel: discord.abc.GuildChannel):
-    embed = make_embed(
-        "🗑️ チャンネル削除",
-        f"`#{channel.name}` (タイプ: {channel.type})",
-        color=discord.Color.red(),
-    )
+    embed = make_embed("🗑️ チャンネル削除", f"`#{channel.name}` (タイプ: {channel.type})", color=discord.Color.red())
     await send_log(channel.guild, embed)
 
 
@@ -423,17 +689,12 @@ async def on_guild_channel_update(before: discord.abc.GuildChannel, after: disco
         changes.append(f"**NSFW:** {before.nsfw} → {after.nsfw}")
     if not changes:
         return
-    embed = make_embed(
-        "🔧 チャンネル更新",
-        f"{after.mention}\n" + "\n".join(changes),
-        color=discord.Color.orange(),
-    )
+    embed = make_embed("🔧 チャンネル更新", f"{after.mention}\n" + "\n".join(changes), color=discord.Color.orange())
     await send_log(after.guild, embed)
 
 
-# ---------------------------------------------------------------------------
-# ROLE EVENTS
-# ---------------------------------------------------------------------------
+# ── Roles ─────────────────────────────────────────────────────────────────────
+
 @bot.event
 async def on_guild_role_create(role: discord.Role):
     embed = make_embed("✨ ロール作成", f"{role.mention} (`{role.name}`)", color=discord.Color.green())
@@ -461,36 +722,23 @@ async def on_guild_role_update(before: discord.Role, after: discord.Role):
         changes.append(f"**メンション可能:** {before.mentionable} → {after.mentionable}")
     if not changes:
         return
-    embed = make_embed(
-        "🔧 ロール更新",
-        f"{after.mention}\n" + "\n".join(changes),
-        color=discord.Color.orange(),
-    )
+    embed = make_embed("🔧 ロール更新", f"{after.mention}\n" + "\n".join(changes), color=discord.Color.orange())
     await send_log(after.guild, embed)
 
 
-# ---------------------------------------------------------------------------
-# VOICE EVENTS
-# ---------------------------------------------------------------------------
+# ── Voice ─────────────────────────────────────────────────────────────────────
+
 @bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
     if before.channel == after.channel:
         changes = []
-        if before.self_mute != after.self_mute:
-            changes.append(f"自己ミュート: {before.self_mute} → {after.self_mute}")
-        if before.self_deaf != after.self_deaf:
-            changes.append(f"自己スピーカーミュート: {before.self_deaf} → {after.self_deaf}")
-        if before.self_stream != after.self_stream:
-            changes.append(f"配信: {before.self_stream} → {after.self_stream}")
-        if before.self_video != after.self_video:
-            changes.append(f"カメラ: {before.self_video} → {after.self_video}")
+        if before.self_mute   != after.self_mute:   changes.append(f"自己ミュート: {before.self_mute} → {after.self_mute}")
+        if before.self_deaf   != after.self_deaf:   changes.append(f"自己スピーカーミュート: {before.self_deaf} → {after.self_deaf}")
+        if before.self_stream != after.self_stream: changes.append(f"配信: {before.self_stream} → {after.self_stream}")
+        if before.self_video  != after.self_video:  changes.append(f"カメラ: {before.self_video} → {after.self_video}")
         if not changes:
             return
-        embed = make_embed(
-            "🎙️ ボイス状態変更",
-            f"{member.mention} ({after.channel.mention} 内)\n" + "\n".join(changes),
-            color=discord.Color.blue(),
-        )
+        embed = make_embed("🎙️ ボイス状態変更", f"{member.mention} ({after.channel.mention} 内)\n" + "\n".join(changes), color=discord.Color.blue())
     elif before.channel is None:
         embed = make_embed("🔊 ボイス参加", f"{member.mention} が {after.channel.mention} に参加しました", color=discord.Color.green())
     elif after.channel is None:
@@ -500,9 +748,8 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
     await send_log(member.guild, embed)
 
 
-# ---------------------------------------------------------------------------
-# REACTION EVENTS
-# ---------------------------------------------------------------------------
+# ── Reactions ─────────────────────────────────────────────────────────────────
+
 @bot.event
 async def on_reaction_add(reaction: discord.Reaction, user: discord.User):
     if user.bot:
@@ -527,16 +774,11 @@ async def on_reaction_remove(reaction: discord.Reaction, user: discord.User):
     await send_log(reaction.message.guild, embed)
 
 
-# ---------------------------------------------------------------------------
-# THREAD EVENTS
-# ---------------------------------------------------------------------------
+# ── Threads ───────────────────────────────────────────────────────────────────
+
 @bot.event
 async def on_thread_create(thread: discord.Thread):
-    embed = make_embed(
-        "🧵 スレッド作成",
-        f"{thread.mention}（{thread.parent.mention if thread.parent else '不明'} 内）",
-        color=discord.Color.green(),
-    )
+    embed = make_embed("🧵 スレッド作成", f"{thread.mention}（{thread.parent.mention if thread.parent else '不明'} 内）", color=discord.Color.green())
     if thread.owner:
         embed.add_field(name="作成者", value=thread.owner.mention)
     await send_log(thread.guild, embed)
@@ -544,36 +786,24 @@ async def on_thread_create(thread: discord.Thread):
 
 @bot.event
 async def on_thread_delete(thread: discord.Thread):
-    embed = make_embed(
-        "🗑️ スレッド削除",
-        f"`{thread.name}`（{thread.parent.mention if thread.parent else '不明'} 内）",
-        color=discord.Color.red(),
-    )
+    embed = make_embed("🗑️ スレッド削除", f"`{thread.name}`（{thread.parent.mention if thread.parent else '不明'} 内）", color=discord.Color.red())
     await send_log(thread.guild, embed)
 
 
 @bot.event
 async def on_thread_update(before: discord.Thread, after: discord.Thread):
     changes = []
-    if before.name != after.name:
-        changes.append(f"**名前:** `{before.name}` → `{after.name}`")
-    if before.archived != after.archived:
-        changes.append(f"**アーカイブ:** {before.archived} → {after.archived}")
-    if before.locked != after.locked:
-        changes.append(f"**ロック:** {before.locked} → {after.locked}")
+    if before.name     != after.name:     changes.append(f"**名前:** `{before.name}` → `{after.name}`")
+    if before.archived != after.archived: changes.append(f"**アーカイブ:** {before.archived} → {after.archived}")
+    if before.locked   != after.locked:   changes.append(f"**ロック:** {before.locked} → {after.locked}")
     if not changes:
         return
-    embed = make_embed(
-        "🔧 スレッド更新",
-        f"{after.mention}\n" + "\n".join(changes),
-        color=discord.Color.orange(),
-    )
+    embed = make_embed("🔧 スレッド更新", f"{after.mention}\n" + "\n".join(changes), color=discord.Color.orange())
     await send_log(after.guild, embed)
 
 
-# ---------------------------------------------------------------------------
-# GUILD / INTEGRATION EVENTS
-# ---------------------------------------------------------------------------
+# ── Guild ─────────────────────────────────────────────────────────────────────
+
 @bot.event
 async def on_guild_update(before: discord.Guild, after: discord.Guild):
     changes = []
@@ -593,13 +823,11 @@ async def on_guild_update(before: discord.Guild, after: discord.Guild):
 
 @bot.event
 async def on_guild_emojis_update(guild: discord.Guild, before: tuple, after: tuple):
-    added = set(after) - set(before)
+    added   = set(after) - set(before)
     removed = set(before) - set(after)
     desc = []
-    if added:
-        desc.append("**追加:** " + " ".join(str(e) for e in added))
-    if removed:
-        desc.append("**削除:** " + " ".join(f"`:{e.name}:`" for e in removed))
+    if added:   desc.append("**追加:** " + " ".join(str(e) for e in added))
+    if removed: desc.append("**削除:** " + " ".join(f"`:{e.name}:`" for e in removed))
     embed = make_embed("😀 絵文字更新", "\n".join(desc), color=discord.Color.gold())
     await send_log(guild, embed)
 
@@ -624,9 +852,8 @@ async def on_invite_delete(invite: discord.Invite):
     await send_log(invite.guild, embed)
 
 
-# ---------------------------------------------------------------------------
-# Error handler
-# ---------------------------------------------------------------------------
+# ── Error handler ─────────────────────────────────────────────────────────────
+
 @bot.event
 async def on_command_error(ctx: commands.Context, error: commands.CommandError):
     if isinstance(error, commands.MissingPermissions):
