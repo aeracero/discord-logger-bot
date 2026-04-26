@@ -438,37 +438,115 @@ async def on_message(message: discord.Message):
             except (discord.Forbidden, discord.HTTPException):
                 pass
 
+            bot_member = message.guild.me
+
             if action == "mute":
+                # Discord API forbids timing out the server owner
+                if author.id == message.guild.owner_id:
+                    embed = make_embed(
+                        "⚠️ NGワード検出 — サーバーオーナーのためスキップ",
+                        f"{author.mention} はサーバーオーナーのためミュートできません。",
+                        color=discord.Color.yellow(),
+                    )
+                    embed.add_field(name="検出ワード", value=f"||`{word}`||", inline=True)
+                    embed.add_field(name="チャンネル", value=message.channel.mention, inline=True)
+                    embed.add_field(name="メッセージ内容", value=f"||{message.content[:500]}||", inline=False)
+                    await send_log(message.guild, embed)
+                    break
+
+                # Check role hierarchy — bot's top role must be above target's top role
+                if bot_member.top_role <= author.top_role:
+                    embed = make_embed(
+                        "⚠️ NGワード検出 — ミュート失敗（ロール階層）",
+                        f"{author.mention} のロールがBotより高いためミュートできませんでした。",
+                        color=discord.Color.yellow(),
+                    )
+                    embed.add_field(name="検出ワード", value=f"||`{word}`||", inline=True)
+                    embed.add_field(name="チャンネル", value=message.channel.mention, inline=True)
+                    embed.add_field(name="対処方法", value="サーバー設定 → ロール で、Botのロールを最上位に移動してください。", inline=False)
+                    embed.add_field(name="メッセージ内容", value=f"||{message.content[:500]}||", inline=False)
+                    await send_log(message.guild, embed)
+                    log.warning(f"[{message.guild.name}] ロール階層エラー: {author} のロールがBotより高い")
+                    break
+
                 until = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=mute_dur)
                 try:
                     await author.timeout(until, reason=f"NGワード検出: {word}")
-                except (discord.Forbidden, discord.HTTPException) as e:
-                    log.warning(f"Cannot mute {author} for NG word: {e}")
-
-                embed = make_embed(
-                    "🔇 NGワード検出 — 自動ミュート",
-                    f"{author.mention} (`{author}`) をミュートしました。",
-                    color=discord.Color.orange(),
-                )
-                embed.add_field(name="検出ワード", value=f"||`{word}`||", inline=True)
-                embed.add_field(name="チャンネル", value=message.channel.mention, inline=True)
-                embed.add_field(name="ミュート期間", value=f"{mute_dur}分", inline=True)
-                embed.add_field(name="メッセージ内容", value=f"||{message.content[:500]}||", inline=False)
+                    embed = make_embed(
+                        "🔇 NGワード検出 — 自動ミュート",
+                        f"{author.mention} (`{author}`) をミュートしました。",
+                        color=discord.Color.orange(),
+                    )
+                    embed.add_field(name="検出ワード", value=f"||`{word}`||", inline=True)
+                    embed.add_field(name="チャンネル", value=message.channel.mention, inline=True)
+                    embed.add_field(name="ミュート期間", value=f"{mute_dur}分", inline=True)
+                    embed.add_field(name="メッセージ内容", value=f"||{message.content[:500]}||", inline=False)
+                except discord.Forbidden:
+                    embed = make_embed(
+                        "⚠️ NGワード検出 — ミュート失敗（権限不足）",
+                        f"{author.mention} をミュートしようとしましたが、権限が不足しています。",
+                        color=discord.Color.yellow(),
+                    )
+                    embed.add_field(name="検出ワード", value=f"||`{word}`||", inline=True)
+                    embed.add_field(name="対処方法", value="Botに **メンバーをタイムアウト** 権限があるか確認してください。", inline=False)
+                except discord.HTTPException as e:
+                    embed = make_embed(
+                        "⚠️ NGワード検出 — ミュートエラー",
+                        f"{author.mention} のミュート中にエラーが発生しました: `{e}`",
+                        color=discord.Color.yellow(),
+                    )
+                    embed.add_field(name="検出ワード", value=f"||`{word}`||", inline=True)
 
             else:  # ban
+                # Skip owner
+                if author.id == message.guild.owner_id:
+                    embed = make_embed(
+                        "⚠️ NGワード検出 — サーバーオーナーのためスキップ",
+                        f"{author.mention} はサーバーオーナーのためBANできません。",
+                        color=discord.Color.yellow(),
+                    )
+                    embed.add_field(name="検出ワード", value=f"||`{word}`||", inline=True)
+                    embed.add_field(name="チャンネル", value=message.channel.mention, inline=True)
+                    await send_log(message.guild, embed)
+                    break
+
+                # Check role hierarchy for ban too
+                if bot_member.top_role <= author.top_role:
+                    embed = make_embed(
+                        "⚠️ NGワード検出 — BAN失敗（ロール階層）",
+                        f"{author.mention} のロールがBotより高いためBANできませんでした。",
+                        color=discord.Color.yellow(),
+                    )
+                    embed.add_field(name="検出ワード", value=f"||`{word}`||", inline=True)
+                    embed.add_field(name="対処方法", value="サーバー設定 → ロール で、Botのロールを最上位に移動してください。", inline=False)
+                    await send_log(message.guild, embed)
+                    log.warning(f"[{message.guild.name}] ロール階層エラー（BAN）: {author} のロールがBotより高い")
+                    break
+
                 try:
                     await message.guild.ban(author, reason=f"NGワード検出: {word}")
-                except (discord.Forbidden, discord.HTTPException) as e:
-                    log.warning(f"Cannot ban {author} for NG word: {e}")
-
-                embed = make_embed(
-                    "🔨 NGワード検出 — 自動BAN",
-                    f"{author.mention} (`{author}`) をBANしました。",
-                    color=discord.Color.dark_red(),
-                )
-                embed.add_field(name="検出ワード", value=f"||`{word}`||", inline=True)
-                embed.add_field(name="チャンネル", value=message.channel.mention, inline=True)
-                embed.add_field(name="メッセージ内容", value=f"||{message.content[:500]}||", inline=False)
+                    embed = make_embed(
+                        "🔨 NGワード検出 — 自動BAN",
+                        f"{author.mention} (`{author}`) をBANしました。",
+                        color=discord.Color.dark_red(),
+                    )
+                    embed.add_field(name="検出ワード", value=f"||`{word}`||", inline=True)
+                    embed.add_field(name="チャンネル", value=message.channel.mention, inline=True)
+                    embed.add_field(name="メッセージ内容", value=f"||{message.content[:500]}||", inline=False)
+                except discord.Forbidden:
+                    embed = make_embed(
+                        "⚠️ NGワード検出 — BAN失敗（権限不足）",
+                        f"{author.mention} をBANしようとしましたが、権限が不足しています。",
+                        color=discord.Color.yellow(),
+                    )
+                    embed.add_field(name="検出ワード", value=f"||`{word}`||", inline=True)
+                except discord.HTTPException as e:
+                    embed = make_embed(
+                        "⚠️ NGワード検出 — BANエラー",
+                        f"{author.mention} のBAN中にエラーが発生しました: `{e}`",
+                        color=discord.Color.yellow(),
+                    )
+                    embed.add_field(name="検出ワード", value=f"||`{word}`||", inline=True)
 
             await send_log(message.guild, embed)
             log.info(f"[{message.guild.name}] NGワード '{word}' 検出 → {action} : {author}")
