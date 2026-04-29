@@ -16,6 +16,7 @@ Setup:
  8. View/change bot settings:  /settings show | mute_duration | alt_similarity | alt_max_age | toggle
  9. Security features:  /security show | raid | account_age | link_filter | antispam | mention_spam | antihoisting
 10. Manual lockdown:  !lockdown on | off
+11. AI moderation (requires GEMINI_API_KEY env var):  /ai show | configure | test
 """
 
 import os
@@ -30,14 +31,25 @@ from pathlib import Path
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
+
+# ---------------------------------------------------------------------------
+# AI Integration (Gemini) — graceful degradation if package/key absent
+# ---------------------------------------------------------------------------
+try:
+    import google.generativeai as genai
+    _GENAI_PKG_AVAILABLE = True
+except ImportError:
+    genai = None
+    _GENAI_PKG_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 load_dotenv()
 TOKEN          = os.getenv("DISCORD_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 COMMAND_PREFIX = os.getenv("COMMAND_PREFIX", "!")
 CONFIG_PATH          = Path("log_channels.json")
 LOG_FILE_PATH        = Path("server_audit.log")
@@ -66,6 +78,18 @@ DISCORD_INVITE_REGEX = re.compile(
 )
 # A name that starts with a non-letter/non-number is considered "hoisting"
 HOISTING_REGEX = re.compile(r'^[^a-zA-Z0-9぀-ヿ一-鿿㐀-䶿]')
+
+# AI RAM efficiency constants
+AI_MAX_USERS_PER_GUILD = 500   # max users tracked per guild
+AI_MAX_MSGS_PER_USER   = 3     # messages kept per user for context
+AI_MAX_MSG_CHARS       = 120   # chars stored per message
+
+# Soft signals that trigger AI analysis (not applied to every message)
+AI_SUSPICIOUS_KEYWORDS = frozenset({
+    "free nitro", "giveaway", "claim your", "airdrop",
+    "crypto", "investment", "click here", "win ", "prize",
+    "limited time", "discord gift", "http://", "https://t.me",
+})
 
 # ---------------------------------------------------------------------------
 # Log event categories
@@ -122,6 +146,16 @@ join_tracker: dict[str, list[datetime.datetime]] = defaultdict(list)
 message_tracker: dict[str, dict[int, list[datetime.datetime]]] = defaultdict(
     lambda: defaultdict(list)
 )
+
+# AI in-memory context (bounded to stay RAM-friendly on Railway free tier)
+# guild_id -> {user_id: list of short message strings}
+user_message_history: dict[str, dict[int, list[str]]] = defaultdict(lambda: defaultdict(list))
+# guild_id -> {user_id: last_ai_check_datetime}
+ai_cooldowns: dict[str, dict[int, datetime.datetime]] = defaultdict(dict)
+
+# Global AI state (set during on_ready via init_ai())
+ai_model = None
+AI_ENABLED = False
 
 # ---------------------------------------------------------------------------
 # Bot setup
@@ -227,6 +261,15 @@ _SECURITY_DEFAULTS: dict[str, dict] = {
     "antihoisting": {
         "enabled": False,
     },
+    "ai_moderation": {
+        "enabled":              False,
+        "analyze_joins":        True,
+        "analyze_messages":     True,
+        "action_suspicious":    "flag",  # "flag" | "mute" | "kick"
+        "action_attacker":      "mute",  # "flag" | "mute" | "kick" | "ban"
+        "confidence_threshold": 70,      # 0-100; only act if AI is this confident
+        "cooldown_seconds":     60,      # min seconds between checks per user
+    },
 }
 
 
@@ -296,6 +339,245 @@ async def lockdown_guild(guild: discord.Guild, lock: bool) -> int:
             pass
     return count
 
+# ===========================================================================
+# AI (Gemini) — initialization, analysis, helpers
+# ===========================================================================
+
+def init_ai() -> None:
+    """Initialize Gemini model if the package and API key are both available."""
+    global ai_model, AI_ENABLED
+    if not _GENAI_PKG_AVAILABLE:
+        log.info("AI: google-generativeai not installed — AI features disabled.")
+        return
+    if not GEMINI_API_KEY:
+        log.info("AI: GEMINI_API_KEY not set — AI features disabled.")
+        return
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+        ai_model = genai.GenerativeModel(
+            model_name="gemini-1.5-flash",
+            generation_config=genai.GenerationConfig(
+                temperature=0.1,
+                max_output_tokens=200,
+            ),
+        )
+        AI_ENABLED = True
+        log.info("AI: Gemini 1.5 Flash initialized successfully.")
+    except Exception as e:
+        log.warning(f"AI: Failed to initialize Gemini: {e}")
+        AI_ENABLED = False
+
+
+def _should_trigger_ai_message(message: discord.Message) -> bool:
+    """Return True if a message has soft signals that warrant AI analysis."""
+    content_lower = message.content.lower()
+    if any(kw in content_lower for kw in AI_SUSPICIOUS_KEYWORDS):
+        return True
+    if message.mention_everyone:
+        return True
+    if len(message.mentions) >= 3:
+        return True
+    # Short message with a URL — common phishing pattern
+    if URL_REGEX.search(message.content) and len(message.content) < 100:
+        return True
+    return False
+
+
+def update_message_history(guild_id: str, user_id: int, content: str) -> None:
+    """Store a truncated message in per-user history, capped for RAM efficiency."""
+    guild_hist = user_message_history[guild_id]
+    # If guild is at the per-guild user cap, evict the oldest tracked user
+    if user_id not in guild_hist and len(guild_hist) >= AI_MAX_USERS_PER_GUILD:
+        oldest_uid = next(iter(guild_hist))
+        del guild_hist[oldest_uid]
+    hist = guild_hist[user_id]
+    hist.append(content[:AI_MAX_MSG_CHARS])
+    if len(hist) > AI_MAX_MSGS_PER_USER:
+        hist.pop(0)
+
+
+async def analyze_with_ai(context: str) -> dict:
+    """
+    Send context to Gemini and parse the verdict.
+    Returns {"verdict": "normal"|"suspicious"|"attacker", "confidence": 0-100, "reason": str}.
+    Falls back gracefully on any error.
+    """
+    if not AI_ENABLED or ai_model is None:
+        return {"verdict": "normal", "confidence": 0, "reason": "AI is not enabled"}
+
+    prompt = (
+        "You are a Discord server security bot.\n"
+        "Classify the user described below as ONE of:\n"
+        "  normal     — regular user, no threat\n"
+        "  suspicious — unusual behaviour, possible threat but not confirmed\n"
+        "  attacker   — clear threat: spam, phishing, scam, or harassment\n\n"
+        "Reply ONLY in this exact format (no extra text):\n"
+        "VERDICT: <normal|suspicious|attacker>\n"
+        "CONFIDENCE: <0-100>\n"
+        "REASON: <one concise sentence>\n\n"
+        f"Context:\n{context}"
+    )
+
+    try:
+        response = await asyncio.to_thread(
+            lambda: ai_model.generate_content(prompt).text
+        )
+        lines = {}
+        for line in response.strip().splitlines():
+            if ":" in line:
+                k, v = line.split(":", 1)
+                lines[k.strip().upper()] = v.strip()
+        verdict    = lines.get("VERDICT", "normal").lower()
+        confidence = int(lines.get("CONFIDENCE", "0"))
+        reason     = lines.get("REASON", "No reason provided.")
+        if verdict not in ("normal", "suspicious", "attacker"):
+            verdict = "normal"
+        confidence = max(0, min(100, confidence))
+        return {"verdict": verdict, "confidence": confidence, "reason": reason}
+    except Exception as e:
+        log.warning(f"AI analysis error: {e}")
+        return {"verdict": "normal", "confidence": 0, "reason": f"Analysis error: {e}"}
+
+
+async def handle_ai_verdict(
+    guild: discord.Guild,
+    member: discord.Member,
+    result: dict,
+    cfg: dict,
+    context_label: str,
+) -> None:
+    """Log and apply the configured action when AI returns a non-normal verdict."""
+    verdict    = result["verdict"]
+    confidence = result["confidence"]
+    reason     = result["reason"]
+
+    if verdict == "normal" or confidence < cfg["confidence_threshold"]:
+        return
+
+    action = cfg["action_attacker"] if verdict == "attacker" else cfg["action_suspicious"]
+
+    color_map = {
+        "flag": discord.Color.yellow(),
+        "mute": discord.Color.orange(),
+        "kick": discord.Color.red(),
+        "ban":  discord.Color.dark_red(),
+    }
+    verdict_emoji = {"suspicious": "⚠️", "attacker": "🚨"}
+    embed = make_embed(
+        f"🤖 AI判定 — {verdict_emoji.get(verdict, '?')} {verdict.upper()} ({confidence}%)",
+        f"{member.mention} (`{member}`) が AI によって **{verdict}** と判定されました。",
+        color=color_map.get(action, discord.Color.yellow()),
+    )
+    embed.add_field(name="判定理由",       value=reason,       inline=False)
+    embed.add_field(name="コンテキスト",   value=context_label, inline=True)
+    embed.add_field(name="アクション",     value=action,        inline=True)
+    embed.add_field(name="信頼度",         value=f"{confidence}%", inline=True)
+
+    mute_dur = get_setting(str(guild.id), "mute_duration")
+    action_result = ""
+
+    if action == "flag":
+        action_result = "🚩 フラグを立てました（ログのみ）"
+    elif action == "mute":
+        success = await apply_mute(member, mute_dur, reason=f"AI判定: {verdict} ({confidence}%)")
+        action_result = f"{'✅' if success else '❌'} {mute_dur}分ミュート"
+    elif action == "kick":
+        try:
+            await member.kick(reason=f"AI判定: {verdict} ({confidence}%)")
+            action_result = "✅ キックしました"
+        except (discord.Forbidden, discord.HTTPException) as e:
+            action_result = f"❌ キック失敗: {e}"
+    elif action == "ban":
+        success = await apply_ban(member, reason=f"AI判定: {verdict} ({confidence}%)")
+        action_result = "✅ BANしました" if success else "❌ BAN失敗"
+
+    embed.add_field(name="実行結果", value=action_result, inline=False)
+    await send_log(guild, embed)
+    log.info(f"[{guild.name}] AI verdict: {verdict} ({confidence}%) → {action}: {member} | {reason}")
+
+
+async def check_ai_join(member: discord.Member) -> None:
+    """Analyze a new member's profile with AI on join."""
+    if not AI_ENABLED:
+        return
+    guild_id = str(member.guild.id)
+    cfg = get_security(guild_id, "ai_moderation")
+    if not cfg["enabled"] or not cfg["analyze_joins"]:
+        return
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    account_age_days = (now - member.created_at).days
+    context = (
+        f"A user just joined the server.\n"
+        f"Username: {member.name}\n"
+        f"Display name: {member.display_name}\n"
+        f"Account age: {account_age_days} days\n"
+        f"Server member count: {member.guild.member_count}\n"
+        f"Has avatar: {'yes' if member.avatar else 'no'}"
+    )
+    result = await analyze_with_ai(context)
+    await handle_ai_verdict(member.guild, member, result, cfg, "参加時のプロフィール分析")
+
+
+async def check_ai_message(message: discord.Message) -> None:
+    """Analyze a message with AI if soft-signal heuristics fire."""
+    if not AI_ENABLED:
+        return
+    guild_id = str(message.guild.id)
+    cfg = get_security(guild_id, "ai_moderation")
+    if not cfg["enabled"] or not cfg["analyze_messages"]:
+        return
+
+    author = message.author
+    now    = datetime.datetime.now(datetime.timezone.utc)
+
+    # Per-user cooldown check
+    last = ai_cooldowns[guild_id].get(author.id)
+    if last and (now - last).total_seconds() < cfg["cooldown_seconds"]:
+        return
+
+    # Only analyse when soft signals are present
+    if not _should_trigger_ai_message(message):
+        return
+
+    update_message_history(guild_id, author.id, message.content)
+    history      = user_message_history[guild_id].get(author.id, [])
+    history_text = "\n".join(f"  - {m}" for m in history) or "  (no history)"
+    account_age_days = (now - author.created_at).days
+
+    context = (
+        f"A server member sent a message that triggered a security signal.\n"
+        f"Username: {author.name}\n"
+        f"Account age: {account_age_days} days\n"
+        f"Current message: {message.content[:300]}\n"
+        f"Recent message history ({len(history)} messages):\n{history_text}\n"
+        f"Mentions @everyone: {message.mention_everyone}\n"
+        f"User mentions: {len(message.mentions)}\n"
+        f"Contains URLs: {bool(URL_REGEX.search(message.content))}"
+    )
+
+    ai_cooldowns[guild_id][author.id] = now
+    result = await analyze_with_ai(context)
+    await handle_ai_verdict(
+        message.guild, author, result, cfg,
+        f"メッセージ分析（{message.channel.mention}）",
+    )
+
+
+@tasks.loop(minutes=10)
+async def cleanup_ai_data() -> None:
+    """Periodically purge stale AI cooldowns and message history to free RAM."""
+    now   = datetime.datetime.now(datetime.timezone.utc)
+    cutoff = 300  # seconds — remove cooldowns older than 5 min
+    for guild_id in list(ai_cooldowns.keys()):
+        stale = [uid for uid, ts in ai_cooldowns[guild_id].items()
+                 if (now - ts).total_seconds() > cutoff]
+        for uid in stale:
+            del ai_cooldowns[guild_id][uid]
+        if not ai_cooldowns[guild_id]:
+            del ai_cooldowns[guild_id]
+
+
 # ---------------------------------------------------------------------------
 # Startup
 # ---------------------------------------------------------------------------
@@ -303,6 +585,9 @@ async def lockdown_guild(guild: discord.Guild, lock: bool) -> int:
 async def on_ready():
     log.info(f"Logged in as {bot.user} (id={bot.user.id})")
     log.info(f"Watching {len(bot.guilds)} guild(s)")
+    init_ai()
+    if not cleanup_ai_data.is_running():
+        cleanup_ai_data.start()
     try:
         synced = await bot.tree.sync()
         log.info(f"Synced {len(synced)} slash command(s)")
@@ -623,6 +908,7 @@ async def security_show(interaction: discord.Interaction):
     spam  = get_security(guild_id, "antispam")
     mspam = get_security(guild_id, "mention_spam")
     hoist = get_security(guild_id, "antihoisting")
+    ai    = get_security(guild_id, "ai_moderation")
 
     action_labels = {"alert": "🔔 アラート", "kick": "👢 キック", "lockdown": "🔒 ロックダウン",
                      "delete": "🗑️ 削除", "mute": "🔇 ミュート", "ban": "🔨 BAN"}
@@ -676,7 +962,22 @@ async def security_show(interaction: discord.Interaction):
         value="名前が記号で始まるユーザーを自動リネームします",
         inline=False,
     )
-    embed.set_footer(text="変更は /security <機能名> で行えます")
+    ai_api_status = (
+        "✅ 動作中" if AI_ENABLED
+        else ("📦 パッケージ未インストール" if not _GENAI_PKG_AVAILABLE else "🔑 APIキー未設定")
+    )
+    embed.add_field(
+        name=f"🤖 AI モデレーション  {_status('ai_moderation')}",
+        value=(
+            f"Gemini API: **{ai_api_status}**\n"
+            f"参加分析: **{'✅' if ai['analyze_joins'] else '🛑'}** | "
+            f"メッセージ分析: **{'✅' if ai['analyze_messages'] else '🛑'}**\n"
+            f"suspicious → **{ai['action_suspicious']}** | attacker → **{ai['action_attacker']}**\n"
+            f"信頼度しきい値: **{ai['confidence_threshold']}%**"
+        ),
+        inline=False,
+    )
+    embed.set_footer(text="変更は /security <機能名> または /ai configure で行えます")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -901,6 +1202,162 @@ async def security_antihoisting(interaction: discord.Interaction, enabled: bool)
     log.info(f"[{interaction.guild.name}] Anti-hoisting → {enabled} by {interaction.user}")
 
 bot.tree.add_command(security_group)
+
+# ===========================================================================
+# SLASH COMMANDS — AI Moderation  (/ai ...)
+# ===========================================================================
+ai_group = app_commands.Group(
+    name="ai",
+    description="AI（Gemini）モデレーション機能の設定",
+    default_permissions=discord.Permissions(manage_guild=True),
+)
+
+
+# ── /ai show ────────────────────────────────────────────────────────────────
+@ai_group.command(name="show", description="AI モデレーション設定と現在のステータスを表示します")
+async def ai_show(interaction: discord.Interaction):
+    guild_id = str(interaction.guild_id)
+    cfg = get_security(guild_id, "ai_moderation")
+
+    ai_api_status = (
+        "✅ APIキー設定済み・動作中"
+        if AI_ENABLED
+        else ("⚠️ google-generativeai パッケージ未インストール" if not _GENAI_PKG_AVAILABLE
+              else "🛑 GEMINI_API_KEY が未設定")
+    )
+    action_labels = {
+        "flag": "🚩 フラグ（ログのみ）",
+        "mute": "🔇 ミュート",
+        "kick": "👢 キック",
+        "ban":  "🔨 BAN",
+    }
+    embed = discord.Embed(
+        title="🤖 AI モデレーション設定",
+        color=discord.Color.purple(),
+        timestamp=datetime.datetime.now(datetime.timezone.utc),
+    )
+    embed.add_field(name="機能ステータス", value="✅ 有効" if cfg["enabled"] else "🛑 無効", inline=True)
+    embed.add_field(name="Gemini API",     value=ai_api_status,                              inline=True)
+    embed.add_field(name="​",         value="​",                                    inline=True)
+    embed.add_field(name="参加時の分析",   value="✅" if cfg["analyze_joins"]    else "🛑",   inline=True)
+    embed.add_field(name="メッセージ分析", value="✅" if cfg["analyze_messages"] else "🛑",   inline=True)
+    embed.add_field(name="​",         value="​",                                    inline=True)
+    embed.add_field(name="suspicious アクション", value=action_labels.get(cfg["action_suspicious"], cfg["action_suspicious"]), inline=True)
+    embed.add_field(name="attacker アクション",   value=action_labels.get(cfg["action_attacker"],   cfg["action_attacker"]),   inline=True)
+    embed.add_field(name="​",         value="​",                                    inline=True)
+    embed.add_field(name="信頼度しきい値", value=f"{cfg['confidence_threshold']}%",           inline=True)
+    embed.add_field(name="クールダウン",   value=f"{cfg['cooldown_seconds']}秒",              inline=True)
+    embed.set_footer(text="設定変更: /ai configure | テスト: /ai test")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ── /ai configure ────────────────────────────────────────────────────────────
+@ai_group.command(name="configure", description="AI モデレーション設定を変更します")
+@app_commands.describe(
+    enabled="AI モデレーションを有効にするか",
+    analyze_joins="参加時にユーザーを AI で分析するか",
+    analyze_messages="メッセージを AI で分析するか",
+    action_suspicious="suspicious 判定時のアクション",
+    action_attacker="attacker 判定時のアクション",
+    confidence_threshold="このパーセント以上の信頼度でアクションを実行（50〜99）",
+    cooldown_seconds="同一ユーザーへの AI 分析の最小間隔・秒（10〜3600）",
+)
+@app_commands.choices(
+    action_suspicious=[
+        app_commands.Choice(name="🚩 フラグ（ログのみ）", value="flag"),
+        app_commands.Choice(name="🔇 ミュート",          value="mute"),
+        app_commands.Choice(name="👢 キック",            value="kick"),
+    ],
+    action_attacker=[
+        app_commands.Choice(name="🚩 フラグ（ログのみ）", value="flag"),
+        app_commands.Choice(name="🔇 ミュート",          value="mute"),
+        app_commands.Choice(name="👢 キック",            value="kick"),
+        app_commands.Choice(name="🔨 BAN",              value="ban"),
+    ],
+)
+async def ai_configure(
+    interaction: discord.Interaction,
+    enabled: bool | None = None,
+    analyze_joins: bool | None = None,
+    analyze_messages: bool | None = None,
+    action_suspicious: app_commands.Choice[str] | None = None,
+    action_attacker: app_commands.Choice[str] | None = None,
+    confidence_threshold: int | None = None,
+    cooldown_seconds: int | None = None,
+):
+    if enabled and not AI_ENABLED:
+        await interaction.response.send_message(
+            "⚠️ Gemini AI が動作していません。\n"
+            "環境変数 `GEMINI_API_KEY` を設定し、`google-generativeai` パッケージをインストールしてください。\n"
+            "設定自体は保存されますが、APIキーが揃うまで AI 分析は行われません。",
+            ephemeral=True,
+        )
+        # Still allow saving the config so it activates once the key is set
+    guild_id = str(interaction.guild_id)
+    if enabled is not None:
+        set_security(guild_id, "ai_moderation", "enabled", enabled)
+    if analyze_joins is not None:
+        set_security(guild_id, "ai_moderation", "analyze_joins", analyze_joins)
+    if analyze_messages is not None:
+        set_security(guild_id, "ai_moderation", "analyze_messages", analyze_messages)
+    if action_suspicious is not None:
+        set_security(guild_id, "ai_moderation", "action_suspicious", action_suspicious.value)
+    if action_attacker is not None:
+        set_security(guild_id, "ai_moderation", "action_attacker", action_attacker.value)
+    if confidence_threshold is not None:
+        if not 50 <= confidence_threshold <= 99:
+            await interaction.response.send_message("⚠️ 50〜99 の範囲で指定してください。", ephemeral=True)
+            return
+        set_security(guild_id, "ai_moderation", "confidence_threshold", confidence_threshold)
+    if cooldown_seconds is not None:
+        if not 10 <= cooldown_seconds <= 3600:
+            await interaction.response.send_message("⚠️ 10〜3600 秒の範囲で指定してください。", ephemeral=True)
+            return
+        set_security(guild_id, "ai_moderation", "cooldown_seconds", cooldown_seconds)
+
+    if not interaction.response.is_done():
+        cfg = get_security(guild_id, "ai_moderation")
+        await interaction.response.send_message(
+            f"🤖 **AI モデレーション** 設定を更新しました。\n"
+            f"有効: **{'✅' if cfg['enabled'] else '🛑'}**\n"
+            f"参加分析: **{'✅' if cfg['analyze_joins'] else '🛑'}** | "
+            f"メッセージ分析: **{'✅' if cfg['analyze_messages'] else '🛑'}**\n"
+            f"suspicious → **{cfg['action_suspicious']}** | attacker → **{cfg['action_attacker']}**\n"
+            f"信頼度しきい値: **{cfg['confidence_threshold']}%** | クールダウン: **{cfg['cooldown_seconds']}秒**",
+            ephemeral=True,
+        )
+    log.info(f"[{interaction.guild.name}] AI moderation config updated by {interaction.user}")
+
+
+# ── /ai test ─────────────────────────────────────────────────────────────────
+@ai_group.command(name="test", description="テキストを AI で分析して判定結果を確認します")
+@app_commands.describe(text="AI に分析させるテキスト（最大 300 文字）")
+async def ai_test(interaction: discord.Interaction, text: str):
+    if not AI_ENABLED:
+        await interaction.response.send_message(
+            "⚠️ Gemini AI が有効になっていません。`GEMINI_API_KEY` を環境変数に設定してください。",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    context = f"Test analysis requested by a server moderator.\nText to analyze: {text[:300]}"
+    result  = await analyze_with_ai(context)
+
+    verdict_display = {"normal": "✅ NORMAL", "suspicious": "⚠️ SUSPICIOUS", "attacker": "🚨 ATTACKER"}
+    color_map = {"normal": discord.Color.green(), "suspicious": discord.Color.yellow(), "attacker": discord.Color.red()}
+    embed = discord.Embed(
+        title=f"🤖 AI テスト結果: {verdict_display.get(result['verdict'], result['verdict'])}",
+        color=color_map.get(result["verdict"], discord.Color.blurple()),
+        timestamp=datetime.datetime.now(datetime.timezone.utc),
+    )
+    embed.add_field(name="判定",   value=result["verdict"],       inline=True)
+    embed.add_field(name="信頼度", value=f"{result['confidence']}%", inline=True)
+    embed.add_field(name="理由",   value=result["reason"],        inline=False)
+    embed.add_field(name="入力テキスト", value=text[:500],        inline=False)
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+bot.tree.add_command(ai_group)
 
 # ===========================================================================
 # NG WORD DETECTION
@@ -1205,7 +1662,10 @@ async def on_message(message: discord.Message):
         return
     if await check_link_filter(message):
         return
-    await check_antispam(message)
+    if await check_antispam(message):
+        return
+    # AI check runs last (non-blocking, soft-signal only)
+    await check_ai_message(message)
 
 
 # ===========================================================================
@@ -1446,6 +1906,7 @@ async def on_member_join(member: discord.Member):
         check_raid(member),
         check_account_age(member),
         check_hoisting(member),
+        check_ai_join(member),
     )
 
 
