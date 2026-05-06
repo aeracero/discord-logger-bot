@@ -1853,9 +1853,43 @@ async def on_message_delete(message: discord.Message):
         return
     if not is_log_enabled(str(message.guild.id), "messages"):
         return
-    embed = make_embed("🗑️ メッセージ削除", color=discord.Color.red())
+
+    # Wait briefly so Discord's audit log has time to register the deletion.
+    await asyncio.sleep(0.8)
+
+    # Try to find who deleted the message via the audit log.
+    deleter: discord.Member | discord.User | None = None
+    try:
+        async for entry in message.guild.audit_logs(
+            limit=5, action=discord.AuditLogAction.message_delete
+        ):
+            age = (datetime.datetime.now(datetime.timezone.utc) - entry.created_at).total_seconds()
+            if (
+                age < 8
+                and entry.target.id == message.author.id
+                and entry.extra.channel.id == message.channel.id
+            ):
+                deleter = entry.user
+                break
+    except (discord.Forbidden, discord.HTTPException):
+        pass  # bot lacks View Audit Log permission — silently skip
+
+    # Use a darker red when someone *else* deleted the message (more notable).
+    deleted_by_other = deleter is not None and deleter.id != message.author.id
+    color = discord.Color.dark_red() if deleted_by_other else discord.Color.red()
+
+    embed = make_embed("🗑️ メッセージ削除", color=color)
     embed.add_field(name="送信者",    value=f"{message.author.mention} (`{message.author}`)", inline=True)
     embed.add_field(name="チャンネル", value=message.channel.mention, inline=True)
+
+    if deleter is not None:
+        if deleted_by_other:
+            embed.add_field(name="🚨 削除者（他ユーザー）", value=f"{deleter.mention} (`{deleter}`)", inline=True)
+        else:
+            embed.add_field(name="削除者", value=f"{deleter.mention} (`{deleter}`) — 本人", inline=True)
+    else:
+        embed.add_field(name="削除者", value="不明（本人削除または権限不足）", inline=True)
+
     if message.content:
         embed.add_field(name="内容", value=message.content[:1024], inline=False)
     if message.attachments:
@@ -1869,11 +1903,32 @@ async def on_bulk_message_delete(messages: list[discord.Message]):
         return
     if not is_log_enabled(str(messages[0].guild.id), "messages"):
         return
+
+    # Wait briefly so Discord's audit log has time to register the bulk delete.
+    await asyncio.sleep(0.8)
+
+    # Try to find who triggered the bulk delete via the audit log.
+    deleter: discord.Member | discord.User | None = None
+    try:
+        async for entry in messages[0].guild.audit_logs(
+            limit=5, action=discord.AuditLogAction.message_bulk_delete
+        ):
+            age = (datetime.datetime.now(datetime.timezone.utc) - entry.created_at).total_seconds()
+            if age < 8:
+                deleter = entry.user
+                break
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
     embed = make_embed(
         "🗑️ 一括メッセージ削除",
         f"{messages[0].channel.mention} で {len(messages)} 件のメッセージが削除されました",
-        color=discord.Color.red(),
+        color=discord.Color.dark_red(),
     )
+    if deleter is not None:
+        embed.add_field(name="🚨 削除者", value=f"{deleter.mention} (`{deleter}`)", inline=True)
+    else:
+        embed.add_field(name="削除者", value="不明（権限不足の可能性）", inline=True)
     await send_log(messages[0].guild, embed)
 
 
