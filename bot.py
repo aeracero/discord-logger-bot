@@ -147,6 +147,13 @@ message_tracker: dict[str, dict[int, list[datetime.datetime]]] = defaultdict(
     lambda: defaultdict(list)
 )
 
+# ---------------------------------------------------------------------------
+# Log message cache — makes bot log messages inerasable
+# message_id -> discord.Embed  (capped to avoid unbounded memory growth)
+# ---------------------------------------------------------------------------
+LOG_MSG_CACHE_MAX = 1000   # keep the last N log embeds in memory
+log_msg_cache: dict[int, discord.Embed] = {}   # message_id -> embed
+
 # AI in-memory context (bounded to stay RAM-friendly on Railway free tier)
 # guild_id -> {user_id: list of short message strings}
 user_message_history: dict[str, dict[int, list[str]]] = defaultdict(lambda: defaultdict(list))
@@ -179,7 +186,13 @@ async def send_log(guild: discord.Guild | None, embed: discord.Embed) -> None:
     if channel is None:
         return
     try:
-        await channel.send(embed=embed)
+        sent = await channel.send(embed=embed)
+        # Cache this message so we can repost it if someone deletes it.
+        if len(log_msg_cache) >= LOG_MSG_CACHE_MAX:
+            # Evict the oldest entry to stay under the cap.
+            oldest_id = next(iter(log_msg_cache))
+            del log_msg_cache[oldest_id]
+        log_msg_cache[sent.id] = embed
     except discord.Forbidden:
         log.warning(f"Missing permissions to send in #{channel} of {guild.name}")
     except discord.HTTPException as e:
@@ -1849,8 +1862,25 @@ async def check_hoisting(member: discord.Member) -> None:
 
 @bot.event
 async def on_message_delete(message: discord.Message):
-    if message.author.bot:
-        return
+    # ── Bot's own log message was deleted → repost it immediately ──────────
+    if message.author.id == bot.user.id:
+        original_embed = log_msg_cache.pop(message.id, None)
+        if original_embed is not None:
+            # Add a footer so everyone can see it was forcibly deleted.
+            repost = original_embed.copy()
+            repost.set_footer(text="⚠️ このログは削除されたため自動再投稿されました")
+            try:
+                sent = await message.channel.send(embed=repost)
+                # Re-cache the reposted message so it too is protected.
+                if len(log_msg_cache) >= LOG_MSG_CACHE_MAX:
+                    oldest_id = next(iter(log_msg_cache))
+                    del log_msg_cache[oldest_id]
+                log_msg_cache[sent.id] = original_embed  # keep original (no stacking footers)
+                log.info(f"[{message.guild.name}] Log message {message.id} was deleted — reposted.")
+            except (discord.Forbidden, discord.HTTPException) as e:
+                log.warning(f"Could not repost deleted log message: {e}")
+        return  # don't log bot-message deletions as normal events
+
     if not is_log_enabled(str(message.guild.id), "messages"):
         return
 
